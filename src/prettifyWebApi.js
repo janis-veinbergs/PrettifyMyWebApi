@@ -42,6 +42,7 @@
     const foundNavigationProperties = [];
 
     let dataTypeFilters = [];
+    let forcedDirtyFields = new Set();
 
     async function odataFetch(url, memoize) {
         if (memoize && memoizedCalls.hasOwnProperty(url)) {
@@ -944,6 +945,7 @@
                 const cancelLookupEditDivs = document.getElementsByClassName('cancelLookupEdit');
                 const cancelLookupEditDiv = [...cancelLookupEditDivs].find(f => f.dataset.fieldname === fieldName);
                 cancelLookupEditDiv.style.display = 'unset';
+                refreshDirtyFieldCheckboxes(window.pfwaMode === 'create');
             };
         }
 
@@ -976,6 +978,7 @@
                 const cancelLookupEditDivs = document.getElementsByClassName('cancelLookupEdit');
                 const cancelLookupEditDiv = [...cancelLookupEditDivs].find(f => f.dataset.fieldname === fieldName);
                 cancelLookupEditDiv.style.display = 'unset';
+                refreshDirtyFieldCheckboxes(window.pfwaMode === 'create');
 
                 // uncommented for now
                 // await lazyLookupInitFunctions[fieldName]?.call();
@@ -1002,8 +1005,324 @@
                 const lookupEditMenuDiv = [...lookupEditMenuDivs].find(f => f.dataset.fieldname === fieldName);
 
                 lookupEditMenuDiv.style.display = 'none';
+                refreshDirtyFieldCheckboxes(window.pfwaMode === 'create');
             };
         }
+    }
+
+    function normalizeIndicatorFieldName(fieldName) {
+        if (fieldName?.startsWith('_') && fieldName.endsWith('_value')) {
+            return fieldName.substring(1, fieldName.length - 6);
+        }
+        return fieldName;
+    }
+
+    function getEnabledInputField(fieldName) {
+        const enabledInputFields = document.getElementsByClassName('enabledInputField');
+        return [...enabledInputFields].find(f => f.dataset.fieldname === fieldName);
+    }
+
+    function getComparableValuesForInput(input, isCreateMode) {
+        const fieldName = input.dataset.fieldname;
+        const dataType = input.dataset.datatype;
+        let originalValue = null;
+
+        if (!isCreateMode) {
+            originalValue = window.originalResponseCopy[fieldName];
+            if (originalValue === undefined) {
+                originalValue = null;
+            }
+        }
+
+        let value = null;
+        const inputValue = input.value;
+
+        if (dataType === 'string' || dataType === 'memo' || dataType === 'uid' || dataType === 'datetime') {
+            if (inputValue === '' && input.dataset.isEmptyString !== 'true') {
+                value = null;
+            } else {
+                value = inputValue;
+            }
+        } else if (dataType === 'option') {
+            if (inputValue === 'null' || !inputValue) {
+                value = null;
+            } else {
+                value = parseInt(inputValue.split(':')[0].replace(' ', ''));
+            }
+        } else if (dataType === 'bool') {
+            if (inputValue === 'null' || !inputValue) {
+                value = null;
+            } else {
+                const rawValue = inputValue.split(':')[0].replace(' ', '');
+                if (rawValue === 'true') {
+                    value = true;
+                } else if (rawValue === 'false') {
+                    value = false;
+                } else {
+                    value = inputValue;
+                }
+            }
+        } else if (dataType === 'multiselectoption') {
+            let multiValue = '';
+            input.querySelectorAll('input').forEach(input => {
+                if (input.checked) {
+                    if (multiValue !== '') {
+                        multiValue += ',';
+                    }
+
+                    multiValue += input.dataset.value;
+                }
+            });
+            value = multiValue === '' ? null : multiValue;
+        } else if (dataType === 'int') {
+            value = inputValue === '' ? null : parseInt(inputValue);
+        } else if (dataType === 'decimal' || dataType === 'money' || dataType === 'float') {
+            value = inputValue === '' ? null : parseFloat(inputValue);
+        } else if (dataType === 'lookup') {
+            if (input.dataset.originalid !== 'null') {
+                originalValue = `/${input.dataset.originalpluralname}(${input.dataset.originalid})`;
+            } else {
+                originalValue = null;
+            }
+
+            if (input.dataset.editmode === 'makenull') {
+                value = null;
+            } else if (input.dataset.editmode === 'update') {
+                const pluralName = input.dataset.pluralname || input.dataset.originalpluralname;
+                value = `/${pluralName}(${inputValue})`;
+            } else {
+                value = originalValue;
+            }
+        }
+
+        return {
+            fieldName,
+            dataType,
+            originalValue,
+            value
+        };
+    }
+
+    function isInputDirty(input, isCreateMode) {
+        const values = getComparableValuesForInput(input, isCreateMode);
+        const value = values.value;
+        const originalValue = values.originalValue;
+
+        if (values.dataType === 'memo') {
+            const originalNormalized = originalValue == null ? null : originalValue.replaceAll('\r\n', '\n');
+            return originalNormalized !== value;
+        }
+
+        if (values.dataType === 'multiselectoption') {
+            const normalize = function (multiValue) {
+                if (multiValue == null || multiValue === '') {
+                    return null;
+                }
+
+                return multiValue
+                    .split(',')
+                    .map(v => v.trim())
+                    .filter(v => v !== '')
+                    .sort()
+                    .join(',');
+            };
+
+            return normalize(value) !== normalize(originalValue);
+        }
+
+        return value !== originalValue && !(value === '' && originalValue == null);
+    }
+
+    function revertInputToOriginalValue(input, isCreateMode) {
+        const dataType = input.dataset.datatype;
+        const fieldName = input.dataset.fieldname;
+        const originalValue = isCreateMode ? null : window.originalResponseCopy[fieldName];
+
+        if (dataType === 'string' || dataType === 'memo' || dataType === 'uid' || dataType === 'datetime' || dataType === 'int' || dataType === 'decimal' || dataType === 'money' || dataType === 'float') {
+            input.value = originalValue == null ? '' : originalValue;
+            return;
+        }
+
+        if (dataType === 'option') {
+            if (originalValue == null) {
+                input.value = 'null';
+            } else {
+                const matchingOption = [...input.options].find(option => option.value.split(':')[0].replace(' ', '') === originalValue.toString());
+                if (matchingOption) {
+                    input.value = matchingOption.value;
+                }
+            }
+            return;
+        }
+
+        if (dataType === 'bool') {
+            if (originalValue == null) {
+                input.value = 'null';
+            } else {
+                const rawValue = originalValue === true ? 'true' : 'false';
+                const matchingOption = [...input.options].find(option => option.value.split(':')[0].replace(' ', '') === rawValue);
+                if (matchingOption) {
+                    input.value = matchingOption.value;
+                }
+            }
+            return;
+        }
+
+        if (dataType === 'multiselectoption') {
+            const values = originalValue?.split(',') || [];
+            const selectedValues = new Set(values);
+            const multiSelectInputs = input.querySelectorAll('input');
+            multiSelectInputs.forEach(optionInput => {
+                optionInput.checked = selectedValues.has(optionInput.dataset.value);
+            });
+            multiSelectInputs.forEach(optionInput => optionInput.onchange?.());
+            return;
+        }
+
+        if (dataType === 'lookup') {
+            input.value = input.dataset.originalname;
+            input.dataset.id = input.dataset.originalid;
+            input.dataset.editmode = null;
+
+            const makeNullDiv = [...document.getElementsByClassName('makeLookupNullDiv')].find(f => f.dataset.fieldname === fieldName);
+            if (makeNullDiv != null) {
+                makeNullDiv.style.display = 'none';
+            }
+
+            const lookupEditMenuDiv = [...document.getElementsByClassName('lookupEditMenuDiv')].find(f => f.dataset.fieldname === fieldName);
+            if (lookupEditMenuDiv != null) {
+                lookupEditMenuDiv.style.display = 'none';
+            }
+
+            const cancelLookupEditDiv = [...document.getElementsByClassName('cancelLookupEdit')].find(f => f.dataset.fieldname === fieldName);
+            if (cancelLookupEditDiv != null) {
+                cancelLookupEditDiv.style.display = 'none';
+            }
+        }
+    }
+
+    function refreshDirtyFieldCheckboxes(isCreateMode) {
+        const dirtyCheckboxes = document.querySelectorAll('.dirtyFieldCheckbox');
+        dirtyCheckboxes.forEach(checkbox => {
+            const fieldName = checkbox.dataset.fieldname;
+            const input = getEnabledInputField(fieldName);
+            if (!input) {
+                return;
+            }
+
+            const isForced = forcedDirtyFields.has(fieldName);
+            const isDirty = isInputDirty(input, isCreateMode);
+            const shouldCheck = isForced || isDirty;
+
+            checkbox.checked = shouldCheck;
+            checkbox.classList.toggle('dirtyFieldCheckboxVisible', shouldCheck);
+        });
+    }
+
+    function setupDirtyFieldCheckboxes(isCreateMode) {
+        forcedDirtyFields = new Set();
+        const keySpans = document.querySelectorAll('.mainPanel .keySpan');
+        keySpans.forEach(keySpan => {
+            const rawFieldName = keySpan.dataset.key;
+            if (!rawFieldName) {
+                return;
+            }
+
+            const fieldName = normalizeIndicatorFieldName(rawFieldName);
+            const input = getEnabledInputField(fieldName);
+            if (!input) {
+                return;
+            }
+
+            if (keySpan.querySelector('.dirtyFieldCheckbox') != null) {
+                return;
+            }
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.classList.add('dirtyFieldCheckbox');
+            checkbox.dataset.fieldname = fieldName;
+            checkbox.title = 'Include this attribute in the save payload. If checked without changing the value, it is still sent in the create/update request and can trigger Flows or plugins that react to this attribute.';
+            checkbox.setAttribute('aria-label', checkbox.title);
+            checkbox.onclick = (e) => e.stopPropagation();
+            checkbox.onchange = () => {
+                if (checkbox.checked) {
+                    forcedDirtyFields.add(fieldName);
+                } else {
+                    forcedDirtyFields.delete(fieldName);
+                    revertInputToOriginalValue(input, isCreateMode);
+                }
+
+                refreshDirtyFieldCheckboxes(isCreateMode);
+            };
+
+            keySpan.prepend(checkbox);
+
+            const hoverTargets = [keySpan, checkbox, input];
+            const fieldContainers = document.querySelectorAll(`.inputContainer[data-fieldname="${fieldName}"]`);
+            fieldContainers.forEach(container => {
+                if (container.parentElement) {
+                    hoverTargets.push(container.parentElement);
+                }
+            });
+
+            const lookupEditLinks = document.querySelector(`.lookupEditLinks[data-fieldname="${fieldName}"]`);
+            if (lookupEditLinks) {
+                hoverTargets.push(lookupEditLinks);
+            }
+
+            const lookupEditMenu = document.querySelector(`.lookupEditMenuDiv[data-fieldname="${fieldName}"]`);
+            if (lookupEditMenu) {
+                hoverTargets.push(lookupEditMenu);
+            }
+
+            const makeLookupNullDiv = document.querySelector(`.makeLookupNullDiv[data-fieldname="${fieldName}"]`);
+            if (makeLookupNullDiv) {
+                hoverTargets.push(makeLookupNullDiv);
+            }
+
+            let hideHoverTimeout = null;
+            const showCheckboxOnHover = () => {
+                if (hideHoverTimeout != null) {
+                    clearTimeout(hideHoverTimeout);
+                    hideHoverTimeout = null;
+                }
+                checkbox.classList.add('dirtyFieldCheckboxHover');
+            };
+
+            const scheduleHideCheckboxHover = () => {
+                if (hideHoverTimeout != null) {
+                    clearTimeout(hideHoverTimeout);
+                }
+
+                hideHoverTimeout = window.setTimeout(() => {
+                    const hasAnyHover = hoverTargets.some(el => el?.matches(':hover'));
+                    if (!hasAnyHover && !checkbox.checked) {
+                        checkbox.classList.remove('dirtyFieldCheckboxHover');
+                    }
+                    hideHoverTimeout = null;
+                }, 240);
+            };
+
+            hoverTargets.forEach(el => {
+                el.addEventListener('mouseenter', showCheckboxOnHover);
+                el.addEventListener('mouseleave', scheduleHideCheckboxHover);
+            });
+        });
+
+        const enabledInputFields = document.querySelectorAll('.mainPanel .enabledInputField');
+        enabledInputFields.forEach(input => {
+            input.addEventListener('input', () => refreshDirtyFieldCheckboxes(isCreateMode));
+            input.addEventListener('change', () => refreshDirtyFieldCheckboxes(isCreateMode));
+
+            if (input.dataset.datatype === 'multiselectoption') {
+                input.querySelectorAll('.multiSelectInput').forEach(optionInput => {
+                    optionInput.addEventListener('change', () => refreshDirtyFieldCheckboxes(isCreateMode));
+                });
+            }
+        });
+
+        refreshDirtyFieldCheckboxes(isCreateMode);
     }
 
     function createInput(container, multiLine, datatype) {
@@ -1165,6 +1484,8 @@
                         }
                     }
                 }
+
+                refreshDirtyFieldCheckboxes(window.pfwaMode === 'create');
             };
         }
     }
@@ -1211,6 +1532,7 @@
 
         input.dataset.id = id;
         input.dataset.originalid = id;
+        input.dataset.originalname = name;
         input.dataset.logicalname = lookupType;
         input.dataset.originallogicalname = lookupType;
 
@@ -1638,6 +1960,7 @@
         }
 
         applySettings();
+        setupDirtyFieldCheckboxes(isCreateMode);
     }
 
 
@@ -1716,6 +2039,7 @@
             const dataType = input.dataset.datatype;
             const inputValue = input.value;
             const fieldName = input.dataset.fieldname;
+            const forceIncludeField = forcedDirtyFields.has(fieldName);
 
             let value = '';
             if (dataType === 'string' || dataType === 'memo' || dataType === 'uid') {
@@ -1851,8 +2175,16 @@
                 } else if (input.dataset.editmode === 'makenull') {
                     value = null;
                 } else {
-                    // skip if not action is required
-                    continue;
+                    if (forceIncludeField) {
+                        if (input.dataset.originalid !== 'null') {
+                            value = `/${input.dataset.originalpluralname}(${input.dataset.originalid})`;
+                        } else {
+                            value = null;
+                        }
+                    } else {
+                        // skip if not action is required
+                        continue;
+                    }
                 }
             } else if (dataType === 'datetime') {
                 if (inputValue === '') {
@@ -1867,9 +2199,9 @@
                 }
             }
 
-            if (value !== originalValue && !(value === '' && originalValue == null)) {
+            if (forceIncludeField || (value !== originalValue && !(value === '' && originalValue == null))) {
                 if (dataType === 'memo') {
-                    if (originalValue?.replaceAll('\r\n', '\n') !== value) {
+                    if (forceIncludeField || originalValue?.replaceAll('\r\n', '\n') !== value) {
                         changedFields[fieldName] = value;
                     }
                 } else if (dataType == 'lookup') {
@@ -3129,6 +3461,28 @@
             .field  {
                 cursor: pointer;
             }    
+
+            .panel .keySpan {
+                position: relative;
+                display: inline-block;
+            }
+
+            .panel .dirtyFieldCheckbox {
+                position: absolute;
+                left: -18px;
+                top: 2px;
+                width: 13px !important;
+                margin: 0 !important;
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            .panel .keySpan:hover .dirtyFieldCheckbox,
+            .panel .dirtyFieldCheckbox.dirtyFieldCheckboxHover,
+            .panel .dirtyFieldCheckbox.dirtyFieldCheckboxVisible {
+                opacity: 1;
+                pointer-events: auto;
+            }
             
             .panel .field:hover .copyButton {
                 display: unset;
