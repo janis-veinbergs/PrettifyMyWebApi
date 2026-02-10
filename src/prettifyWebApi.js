@@ -14,6 +14,13 @@
 
     const replacedQuote = '__~~__REPLACEDQUOTE__~~__';
     const replacedComma = '__~~__REPLACEDCOMMA__~~__';
+    const knownJsonStringFields = new Set(['changeddata', 'formjson']);
+    const knownStructuredStringFieldsByEntity = {
+        audit: new Set(['changeddata']),
+        systemform: new Set(['formjson']),
+        workflow: new Set(['clientdata']),
+        webresource: new Set(['content'])
+    };
 
     const clipBoardIcon = `<svg class='copyIcon' style='width:16px;position:absolute;padding-left:4px' viewBox='0 0 24 24'>
         <path fill='currentColor' d='M19 2h-4.18C14.4.84 13.3 0 12 0S9.6.84 9.18 2H5c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1s-1-.45-1-1s.45-1 1-1zm7 18H5V4h2v3h10V4h2v16z'/>
@@ -43,6 +50,137 @@
 
     let dataTypeFilters = [];
     let forcedDirtyFields = new Set();
+
+    function isJsonLikeString(value) {
+        if (typeof value !== 'string') {
+            return false;
+        }
+
+        const trimmed = value.trim();
+        if (trimmed === '') {
+            return false;
+        }
+
+        return (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+            (trimmed.startsWith('[') && trimmed.endsWith(']'));
+    }
+
+    function isXmlLikeString(value) {
+        if (typeof value !== 'string') {
+            return false;
+        }
+
+        const trimmed = value.trim();
+        if (trimmed === '') {
+            return false;
+        }
+
+        return trimmed.startsWith('<') && trimmed.endsWith('>');
+    }
+
+    function shouldUseStructuredTextArea(entityLogicalName, fieldLogicalName, value, isCreateMode) {
+        const logicalName = fieldLogicalName?.toLowerCase();
+        if (knownJsonStringFields.has(logicalName)) {
+            return true;
+        }
+
+        const entityName = entityLogicalName?.toLowerCase();
+        const configuredFields = knownStructuredStringFieldsByEntity[entityName];
+        if (configuredFields?.has(logicalName)) {
+            return true;
+        }
+
+        if (isCreateMode) {
+            return false;
+        }
+
+        return isJsonLikeString(value) || isXmlLikeString(value);
+    }
+
+    function createStructuredReadOnlyFieldSpan(cls, value, fieldName) {
+        const escapedValue = escapeHtml(value ?? '');
+        return `<span style='display: inline-flex; align-items: flex-start;' class='${escapeHtml(cls)} field structuredReadonlyField'>` +
+            `<div class='structuredReadonlyContainer'>` +
+            `<textarea class='structuredReadonlyTextarea' rows='1' readonly data-fieldname='${escapeHtml(fieldName)}'>${escapedValue}</textarea>` +
+            `<button type='button' class='formatStructuredContentBtn' data-fieldname='${escapeHtml(fieldName)}'>Format</button>` +
+            `</div>` +
+            `<div class='inputContainer containerNotEnabled' style='display: none;' data-fieldname='${escapeHtml(fieldName)}'></div>` +
+            `${copyControlsHtml}</span>`;
+    }
+
+    function formatXml(xml) {
+        const parser = new DOMParser();
+        const parsed = parser.parseFromString(xml, 'application/xml');
+        const parseError = parsed.getElementsByTagName('parsererror')[0];
+        if (parseError) {
+            throw new Error('Invalid XML');
+        }
+
+        const serialized = new XMLSerializer().serializeToString(parsed);
+        const reg = /(>)(<)(\/*)/g;
+        const withBreaks = serialized.replace(reg, '$1\r\n$2$3');
+
+        let formatted = '';
+        let pad = 0;
+        withBreaks.split('\r\n').forEach((node) => {
+            let indent = 0;
+            if (node.match(/^<\/\w/)) {
+                if (pad > 0) {
+                    pad -= 1;
+                }
+            } else if (node.match(/^<\w[^>]*[^/]>.*$/)) {
+                indent = 1;
+            }
+
+            formatted += `${'  '.repeat(pad)}${node}\n`;
+            pad += indent;
+        });
+
+        return formatted.trim();
+    }
+
+    function setStructuredFormatHandlers() {
+        const buttons = document.querySelectorAll('.formatStructuredContentBtn');
+        buttons.forEach(button => {
+            button.onclick = (e) => {
+                e.stopPropagation();
+                const container = button.closest('.structuredReadonlyContainer');
+                const textarea = container?.querySelector('.structuredReadonlyTextarea');
+                if (!textarea) {
+                    return;
+                }
+
+                const current = textarea.value;
+                try {
+                    const trimmed = current.trim();
+                    if (isJsonLikeString(trimmed)) {
+                        const parsed = JSON.parse(trimmed);
+                        textarea.value = JSON.stringify(parsed, null, 2);
+                    } else if (isXmlLikeString(trimmed)) {
+                        textarea.value = formatXml(trimmed);
+                    } else {
+                        alert('Value is not recognized as JSON or XML.');
+                    }
+
+                    if (textarea.rows <= 1) {
+                        textarea.rows = 40;
+                    }
+                } catch (err) {
+                    alert(`Could not format value: ${err.message || err}`);
+                }
+            };
+        });
+    }
+
+    function applyAutoGrowTextarea(textarea) {
+        const resize = () => {
+            textarea.style.height = 'auto';
+            textarea.style.height = `${Math.min(textarea.scrollHeight, 800)}px`;
+        };
+
+        textarea.addEventListener('input', resize);
+        resize();
+    }
 
     async function odataFetch(url, memoize) {
         if (memoize && memoizedCalls.hasOwnProperty(url)) {
@@ -596,11 +734,19 @@
                     ordered[key] = createFieldSpan(cls, value, key) + generateWebApiAnchor(value, 'solutions');
                 }
                 else if (key === primaryIdAttribute) {
-                    ordered[key] = '<b>' + createSpan('primarykey', value) + '</b>';
+                    if (isCreateMode) {
+                        ordered[key] = '<b>' + createFieldSpan('primarykey', value, key) + '</b>';
+                    } else {
+                        ordered[key] = '<b>' + createSpan('primarykey', value) + '</b>';
+                    }
                 } else if (key === primaryNameAttribute) {
                     ordered[key] = '<b>' + createFieldSpan(cls, value, key) + '</b>';
                 } else {
-                    ordered[key] = createFieldSpan(cls, value, key);
+                    if (typeof (value) === 'string' && shouldUseStructuredTextArea(logicalName, key, value, isCreateMode)) {
+                        ordered[key] = createStructuredReadOnlyFieldSpan(cls, value, key);
+                    } else {
+                        ordered[key] = createFieldSpan(cls, value, key);
+                    }
                 }
             }
 
@@ -682,7 +828,9 @@
 
             try {
                 window.copyToClipBoardBusy = true;
-                navigator.clipboard.writeText(el.innerText).then(() => {
+                const readOnlyTextArea = el.querySelector('.structuredReadonlyTextarea');
+                const valueToCopy = readOnlyTextArea ? readOnlyTextArea.value : el.innerText;
+                navigator.clipboard.writeText(valueToCopy).then(() => {
                     const copyIcon = el.querySelector('.copyIcon');
                     const copiedIcon = el.querySelector('.copiedIcon');
                     const copiedNotification = el.querySelector('.copiedNotification');
@@ -1341,6 +1489,17 @@
 
         input.value = value;
 
+        if (datatype === 'string' && input.tagName.toLowerCase() === 'textarea') {
+            input.rows = 4;
+            input.style.resize = 'vertical';
+            input.style.minHeight = '96px';
+            input.style.maxWidth = '900px';
+            input.style.width = 'min(900px, 90vw)';
+            input.style.fontFamily = 'Consolas, Monaco, monospace';
+            input.title = 'JSON-like string detected. Multi-line editor is enabled.';
+            applyAutoGrowTextarea(input);
+        }
+
         setInputMetadata(input, container, datatype);
 
         // in some very rare cases, dataverse will return an empty string instead of null 
@@ -1811,6 +1970,7 @@
         if (isCreateMode) {
             attributesMetadata = await retrieveCreatableAttributes(logicalName);
             let attributesMetadataForUpdate = await retrieveUpdateableAttributes(logicalName);
+            const tableMetadata = await retrieveLogicalAndPrimaryKeyAndPrimaryName(pluralName);
 
             // the statecode is creatable but not listed as such
             // so add 'manually'
@@ -1820,6 +1980,14 @@
                 if (stateCodeAttributeAlreadyAdded == null) {
                     attributesMetadata.push(stateCodeAttribute);
                 }
+            }
+
+            // allow explicit id override for create requests
+            if (tableMetadata.primaryIdAttribute != null && attributesMetadata.find(a => a.LogicalName === tableMetadata.primaryIdAttribute) == null) {
+                attributesMetadata.push({
+                    LogicalName: tableMetadata.primaryIdAttribute,
+                    AttributeType: 'Uniqueidentifier'
+                });
             }
         } else {
             attributesMetadata = await retrieveUpdateableAttributes(logicalName);
@@ -1850,7 +2018,9 @@
 
             const attributeType = attribute.AttributeType;
             if (attributeType === 'String' || attributeType === 'EntityName') {
-                createInput(container, false, 'string');
+                const originalValue = window.originalResponseCopy[container.dataset.fieldname];
+                const useJsonTextArea = shouldUseStructuredTextArea(logicalName, attribute.LogicalName, originalValue, isCreateMode);
+                createInput(container, useJsonTextArea, 'string');
             }
             else if (attributeType === 'Owner') {
                 createLookupInput(container, ['systemuser', 'team']);
@@ -1940,6 +2110,11 @@
 
             // set to fixed heigth for cleaner looking page
             el.style.height = '20px';
+
+            const structuredReadonlyContainer = el.querySelector('.structuredReadonlyContainer');
+            if (structuredReadonlyContainer) {
+                structuredReadonlyContainer.style.display = 'none';
+            }
 
             if (el.classList.contains('lookupField')) {
                 el.style.margin = '1px 0 -2px 0';
@@ -2601,6 +2776,7 @@
             setEditLinkClickHandlers();
             setDeleteLinkClickHandlers();
             setCopyToClipboardHandlers();
+            setStructuredFormatHandlers();
             setLookupEditHandlers();
             setDisassociateClickHandlers();
         }
@@ -2997,6 +3173,7 @@
 
     async function handleCreateNewRecord(logicalName) {
         const creatableAttributes = await retrieveCreatableAttributes(logicalName);
+        const tableMetadata = await retrieveLogicalAndPrimaryKeyAndPrimaryName(window.currentEntityPluralName);
         let jsonObject = {};
 
         for (let attribute of creatableAttributes) {
@@ -3013,6 +3190,11 @@
         // 'manually' add this in, because we want to be able to see this
         // it's not listed as creatable, but it actually is
         jsonObject['statecode'] = null;
+
+        // allow setting id for create scenarios where users need deterministic identifiers
+        if (tableMetadata.primaryIdAttribute != null && jsonObject.hasOwnProperty(tableMetadata.primaryIdAttribute) === false) {
+            jsonObject[tableMetadata.primaryIdAttribute] = null;
+        }
 
         await prettifyWebApi(jsonObject, document.body, window.currentEntityPluralName, false, true);
         await editRecord(logicalName, window.currentEntityPluralName, null, true);
@@ -3457,6 +3639,27 @@
                 display: none;
                 cursor: pointer;
             }  
+
+            .panel .structuredReadonlyContainer {
+                display: inline-flex;
+                gap: 8px;
+                align-items: flex-start;
+            }
+
+            .panel .structuredReadonlyTextarea {
+                width: min(900px, 88vw);
+                min-height: 30px;
+                resize: both;
+                font-family: Consolas, Monaco, monospace;
+                white-space: pre;
+            }
+
+            .panel .formatStructuredContentBtn {
+                height: 24px;
+                cursor: pointer;
+                padding: 2px 8px;
+                font-size: 12px;
+            }
             
             .field  {
                 cursor: pointer;

@@ -2,10 +2,79 @@
     async function odataFetch(url) {
         const response = await fetch(url, { headers: { 'Prefer': 'odata.include-annotations="*"', 'Cache-Control': 'no-cache' } });
 
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw `${response.status} - ${errorText}`;
+        }
+
         return await response.json();
     }
 
-    async function getViewWebApiUrl(entityLogicalName, viewId, viewType) {
+    function normalizeGuid(guid) {
+        if (!guid) {
+            return null;
+        }
+
+        const normalized = guid.replace('{', '').replace('}', '').trim();
+        if (/^[0-9a-fA-F-]{36}$/.test(normalized) === false) {
+            return null;
+        }
+
+        return normalized;
+    }
+
+    function getApiPrefixPath() {
+        const parts = window.location.pathname.split('/').filter(Boolean);
+        if (parts.length <= 1) {
+            return '';
+        }
+
+        if (parts[0].toLowerCase() === 'main.aspx') {
+            return '';
+        }
+
+        return '/' + parts[0];
+    }
+
+    function getVersionCandidates(preferredVersion) {
+        const versions = [];
+
+        if (preferredVersion) {
+            versions.push(preferredVersion);
+        }
+
+        ['9.2', '9.1', '9.0'].forEach(v => {
+            if (versions.includes(v) === false) {
+                versions.push(v);
+            }
+        });
+
+        return versions;
+    }
+
+    async function getWebApiBaseUrl(entityLogicalName, preferredVersion) {
+        const prefixPath = getApiPrefixPath();
+        const versions = getVersionCandidates(preferredVersion);
+
+        for (let version of versions) {
+            const apiUrl = `${window.location.origin}${prefixPath}/api/data/v${version}/`;
+            const requestUrl = `${apiUrl}EntityDefinitions?$select=EntitySetName&$filter=(LogicalName eq %27${entityLogicalName}%27)`;
+
+            try {
+                const result = await odataFetch(requestUrl);
+                if (result?.value?.length > 0) {
+                    const pluralName = result.value[0].EntitySetName;
+                    return `${apiUrl}${pluralName}`;
+                }
+            } catch {
+                // try the next version candidate
+            }
+        }
+
+        throw `Could not resolve Web API base url for table '${entityLogicalName}'.`;
+    }
+
+    async function getViewWebApiUrl(entityLogicalName, viewId, viewType, preferredVersion) {
         let queryParamName = '';
 
         if (viewType == 4230) {
@@ -16,35 +85,35 @@
             throw 'unknown view type: ' + viewType;
         }
 
-        const baseUrl = await getWebApiBaseUrl(entityLogicalName);
+        const baseUrl = await getWebApiBaseUrl(entityLogicalName, preferredVersion);
 
         return `${baseUrl}?${queryParamName}=${viewId}`;;
     }
 
     async function getSingleRowApiUrl() {
         const entityLogicalName = Xrm.Page.data.entity.getEntityName();
+        const versionArray = Xrm.Utility.getGlobalContext().getVersion().split('.');
+        const version = versionArray[0] + '.' + versionArray[1];
 
-        const baseUrl = await getWebApiBaseUrl(entityLogicalName);
+        const baseUrl = await getWebApiBaseUrl(entityLogicalName, version);
 
         const recordId = Xrm.Page.data.entity.getId().replace('{', '').replace('}', '');
 
         return `${baseUrl}(${recordId})`;
     }
 
-    async function getWebApiBaseUrl(entityLogicalName) {
-        const versionArray = Xrm.Utility.getGlobalContext().getVersion().split('.');
-        const version = versionArray[0] + '.' + versionArray[1];
+    async function getSingleRowApiUrlFromLocation() {
+        const urlObj = new URL(window.location.href);
+        const pageType = urlObj.searchParams.get('pagetype');
+        const entityLogicalName = urlObj.searchParams.get('etn');
+        const id = normalizeGuid(urlObj.searchParams.get('id'));
 
-        const apiUrl = window.location.pathname.split('/').length <= 2 ? `/api/data/v${version}/` : `/${window.location.pathname.split('/')[1]}/api/data/v${version}/`
+        if (pageType !== 'entityrecord' || !entityLogicalName || !id) {
+            return null;
+        }
 
-        const requestUrl = apiUrl + 'EntityDefinitions?$select=EntitySetName&$filter=(LogicalName eq %27' + entityLogicalName + '%27)';
-
-        const result = await odataFetch(requestUrl)
-        const pluralName = result.value[0].EntitySetName;
-
-        const baseUrl = window.location.origin + apiUrl + pluralName;
-
-        return baseUrl;
+        const baseUrl = await getWebApiBaseUrl(entityLogicalName);
+        return `${baseUrl}(${id})`;
     }
 
     function getDataverseUrl() {
@@ -70,37 +139,64 @@
         }
     }
 
+    let urlToOpen = '';
+
+    const urlObj = new URL(window.location.href);
+    const viewId = urlObj.searchParams.get('viewid');
+    const entityLogicalName = urlObj.searchParams.get('etn');
+    const viewType = urlObj.searchParams.get('viewType');
+
     if (window.Xrm && window.Xrm.Page) {
-        //no data and no utility => return
-        if (!window.Xrm.Page.data && !window.Xrm.Utility) {
-            alert(`Please open a form or view to use PrettifyMyWebApi`);
-            return;
-        }
-
-        let urlToOpen = '';
-
-        const urlObj = new URL(window.location.href);
-        const viewId = urlObj.searchParams.get('viewid');
-        const entityLogicalName = urlObj.searchParams.get('etn');
-        const viewType = urlObj.searchParams.get('viewType');
-
         try {
             // check if on view
             if (viewId && entityLogicalName && viewType) {
-                urlToOpen = await getViewWebApiUrl(entityLogicalName, viewId, viewType);
-            } else if (window.Xrm.Page.data?.entity) {
+                let preferredVersion = null;
+                if (window.Xrm.Utility?.getGlobalContext) {
+                    const versionArray = Xrm.Utility.getGlobalContext().getVersion().split('.');
+                    preferredVersion = versionArray[0] + '.' + versionArray[1];
+                }
+                urlToOpen = await getViewWebApiUrl(entityLogicalName, viewId, viewType, preferredVersion);
+            } else if (window.Xrm.Page.data?.entity && window.Xrm.Utility?.getGlobalContext) {
                 urlToOpen = await getSingleRowApiUrl();
             } else {
-                alert(`Please open a form or view to use PrettifyMyWebApi`);
-                return;
+                urlToOpen = await getSingleRowApiUrlFromLocation();
             }
         } catch (err) {
             alert(err);
             return;
         }
 
-        urlToOpen += '#p'; // add the secret sauce
-        window.postMessage({ action: 'openInWebApi', url: urlToOpen });
+        if (urlToOpen) {
+            urlToOpen += '#p'; // add the secret sauce
+            window.postMessage({ action: 'openInWebApi', url: urlToOpen });
+            return;
+        }
+    } else if (viewId && entityLogicalName && viewType) {
+        try {
+            urlToOpen = await getViewWebApiUrl(entityLogicalName, viewId, viewType);
+            urlToOpen += '#p';
+            window.postMessage({ action: 'openInWebApi', url: urlToOpen });
+            return;
+        } catch (err) {
+            alert(err);
+            return;
+        }
+    } else {
+        try {
+            const fastOpenRowUrl = await getSingleRowApiUrlFromLocation();
+            if (fastOpenRowUrl) {
+                window.postMessage({ action: 'openInWebApi', url: fastOpenRowUrl + '#p' });
+                return;
+            }
+        } catch {
+            // ignore and continue with regular fallbacks
+        }
+    }
+
+    if (window.Xrm && window.Xrm.Page) {
+        if (!urlToOpen) {
+            alert(`Please open a form or view to use PrettifyMyWebApi`);
+        }
     } else if (/\/api\/data\/v[0-9][0-9]?.[0-9]\//.test(window.location.pathname)) {
         // the host check is for supporting on-prem, where we always want to resort to the postmessage based flow
         // we only need total reload on the workflows table when viewing a single record, because of the monaco editor
